@@ -85,7 +85,13 @@ err()   { printf "%s✗%s %s\n" "$C_RED" "$C_OFF" "$*" >&2; }
 # the scheduler, which does load the env — looked in .state/ and restarted the
 # loop two minutes later.
 if [[ -z "${PATHIEL_STATE_DIR:-}" && -f "$ROOT/.env.local" ]]; then
-  PATHIEL_STATE_DIR="$(grep -E '^PATHIEL_STATE_DIR=' "$ROOT/.env.local" | tail -1 | cut -d= -f2-)"
+  # PATHIEL_STATE_DIR is OPTIONAL (services/trend_engine/env.py falls back to
+  # $ROOT when unset) — most .env.local files never set it, so `grep` finding
+  # no match is the common case, not an error. Without `|| true` that no-match
+  # (grep exit 1) propagates through the pipeline under `set -euo pipefail`
+  # and silently kills this script before it does anything — which is exactly
+  # what made `restart.sh status` print nothing (found 2026-09-23).
+  PATHIEL_STATE_DIR="$(grep -E '^PATHIEL_STATE_DIR=' "$ROOT/.env.local" | tail -1 | cut -d= -f2- || true)"
   export PATHIEL_STATE_DIR
 fi
 HALT_FILE="${PATHIEL_STATE_DIR:-$ROOT}/supervisor_halt.json"
