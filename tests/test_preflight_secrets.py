@@ -111,6 +111,19 @@ def test_openrouter_key_required_only_when_provider_is_openrouter():
     assert "OPENROUTER_API_KEY" in _names_with_status(findings_ok, "PASS")
 
 
+def test_aigw_key_required_only_when_provider_is_aigw():
+    findings_aigw_missing = pf.check_required_present(
+        _complete_env(AI_BRAIN_PROVIDER="aigw", AIGW_API_KEY=""))
+    assert "AIGW_API_KEY" in _names_with_status(findings_aigw_missing, "FAIL")
+
+    findings_default = pf.check_required_present(_complete_env())
+    assert "AIGW_API_KEY" not in {f.name for f in findings_default}
+
+    findings_ok = pf.check_required_present(
+        _complete_env(AI_BRAIN_PROVIDER="aigw", AIGW_API_KEY="sk-aigw-fake000000000"))
+    assert "AIGW_API_KEY" in _names_with_status(findings_ok, "PASS")
+
+
 # ── agent vs master (the highest-value check) ──────────────────────────────────
 
 def test_agent_not_master_fails_when_trading_key_is_master():
@@ -391,6 +404,9 @@ def test_effective_env_file_fills_gaps_not_set_in_process(tmp_path):
     ("claude_cli", "claude_cli"),
     ("codex", "codex_cli"),
     ("codex_cli", "codex_cli"),
+    ("aigw", "aigw"),
+    ("ai_gateway", "aigw"),
+    ("ai-gw", "aigw"),
     ("something_unknown", "openrouter"),
 ])
 def test_effective_ai_brain_provider_normalisation(raw, expected):

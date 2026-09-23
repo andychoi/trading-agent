@@ -44,6 +44,28 @@ def test_openrouter_is_deployable_and_needs_a_key(monkeypatch):
     assert r2["ready"] is False and "OPENROUTER_API_KEY" in r2["reason"]
 
 
+def test_aigw_needs_a_key_and_is_not_deployable_on_the_loopback_default(monkeypatch):
+    monkeypatch.delenv("AIGW_BASE_URL", raising=False)
+    monkeypatch.setenv("AIGW_API_KEY", "sk-aigw-test")
+    r = provider_readiness("aigw")
+    assert r["ready"] is True
+    assert r["deployable"] is False, (
+        "the default AIGW_BASE_URL is a loopback address reachable only from "
+        "this host — a container built with it would run with a dead brain")
+    assert "container" in r["deploy_note"]
+
+    monkeypatch.delenv("AIGW_API_KEY", raising=False)
+    r2 = provider_readiness("aigw")
+    assert r2["ready"] is False and "AIGW_API_KEY" in r2["reason"]
+
+
+def test_aigw_is_deployable_once_base_url_is_not_loopback(monkeypatch):
+    monkeypatch.setenv("AIGW_API_KEY", "sk-aigw-test")
+    monkeypatch.setenv("AIGW_BASE_URL", "https://gw.example.test/v1")
+    r = provider_readiness("aigw")
+    assert r["ready"] is True and r["deployable"] is True
+
+
 def test_readiness_never_raises(monkeypatch):
     """Callers are a healthcheck and a preflight. Both want the reason, not a
     traceback."""

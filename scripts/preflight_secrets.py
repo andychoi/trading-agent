@@ -76,6 +76,7 @@ _DEPLOY_ENV_SIGNALS: Tuple[str, ...] = ("FLY_APP_NAME", "KUBERNETES_SERVICE_HOST
 # required:
 #   "always"       — preflight fails if missing/empty, unconditionally
 #   "openrouter"   — required only when AI_BRAIN_PROVIDER resolves to "openrouter"
+#   "aigw"         — required only when AI_BRAIN_PROVIDER resolves to "aigw"
 #   "optional"     — feature degrades gracefully without it (documented per-var
 #                    in SECRETS.md); preflight never fails on absence
 #   "local_only"   — must NEVER be present in a deployed environment; checked
@@ -84,7 +85,7 @@ _DEPLOY_ENV_SIGNALS: Tuple[str, ...] = ("FLY_APP_NAME", "KUBERNETES_SERVICE_HOST
 class SecretSpec:
     name: str
     purpose: str
-    required: str  # "always" | "openrouter" | "optional" | "local_only"
+    required: str  # "always" | "openrouter" | "aigw" | "optional" | "local_only"
 
 
 REGISTRY: Tuple[SecretSpec, ...] = (
@@ -93,6 +94,7 @@ REGISTRY: Tuple[SecretSpec, ...] = (
     SecretSpec("HYPERLIQUID_MASTER_ADDRESS", "master account public address (funds live here)", "always"),
     SecretSpec("PATHIEL_OPERATOR_TOKEN", "bearer token gating the dashboard operator surface", "always"),
     SecretSpec("OPENROUTER_API_KEY", "OpenRouter API key for the default AI brain provider", "openrouter"),
+    SecretSpec("AIGW_API_KEY", "ai-gateway API key for the aigw AI brain provider", "aigw"),
     SecretSpec("HYPERLIQUID_MASTER_PRIVATE_KEY", "master account private key — treasury transfers only", "local_only"),
     SecretSpec("BRAVE_API_KEY", "Brave Search API key — news context for research (optional)", "optional"),
     SecretSpec("HYDROMANCER_API_KEY", "Hydromancer data-plane API key (research/backfill only)", "optional"),
@@ -195,7 +197,7 @@ def check_required_present(env: Mapping[str, str]) -> List[Finding]:
     findings: List[Finding] = []
     provider = _effective_ai_brain_provider(env)
     for spec in REGISTRY:
-        applies = spec.required == "always" or (spec.required == "openrouter" and provider == "openrouter")
+        applies = spec.required == "always" or spec.required == provider
         if not applies:
             continue
         val = (env.get(spec.name) or "").strip()
@@ -203,7 +205,7 @@ def check_required_present(env: Mapping[str, str]) -> List[Finding]:
             findings.append(Finding("required_present", "PASS", spec.name, "present and non-empty"))
         else:
             reason = "required" if spec.required == "always" else \
-                "required because AI_BRAIN_PROVIDER resolves to 'openrouter'"
+                f"required because AI_BRAIN_PROVIDER resolves to '{spec.required}'"
             findings.append(Finding("required_present", "FAIL", spec.name,
                                      f"missing or empty ({reason}) — {spec.purpose}"))
     return findings
@@ -215,9 +217,12 @@ def _effective_ai_brain_provider(env: Mapping[str, str]) -> str:
     script has zero dependency on the app's import graph — it must still run
     when the app itself is broken."""
     raw = (env.get("AI_BRAIN_PROVIDER") or "").strip().lower().replace("-", "_")
-    aliases = {"claude": "claude_cli", "codex": "codex_cli", "open_router": "openrouter"}
+    aliases = {
+        "claude": "claude_cli", "codex": "codex_cli", "open_router": "openrouter",
+        "ai_gateway": "aigw", "ai_gw": "aigw",
+    }
     provider = aliases.get(raw, raw)
-    if provider in {"openrouter", "claude_cli", "codex_cli"}:
+    if provider in {"openrouter", "aigw", "claude_cli", "codex_cli"}:
         return provider
     return "openrouter"  # DEFAULT_AI_BRAIN_PROVIDER
 

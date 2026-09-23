@@ -18,8 +18,14 @@ from pathiel.agents.config_store import read_agent_config
 
 logger = logging.getLogger(__name__)
 
-AI_BRAIN_PROVIDERS = {"openrouter", "claude_cli", "codex_cli"}
+AI_BRAIN_PROVIDERS = {"openrouter", "aigw", "claude_cli", "codex_cli"}
 DEFAULT_AI_BRAIN_PROVIDER = "openrouter"
+# Loopback default for the operator's host-native ai-gateway service
+# (com.andychoi.ai-gateway on 127.0.0.1:11433) — an OpenAI-compatible proxy in
+# front of whichever backend the operator configured (e.g. the z.ai GLM Coding
+# Plan). Override with AIGW_BASE_URL to point at a reachable gateway from a
+# deployed container.
+DEFAULT_AIGW_BASE_URL = "http://localhost:11433/v1"
 # 120s was too tight for web-search research: the CLI got SIGKILLed mid-search
 # and the loop logged failure-PASSes ("AI research is DOWN") — measured
 # 2026-07-25 on WLD/SPCX/HIMS. Web search legitimately needs 2-4 min. 240s lets
@@ -167,6 +173,8 @@ def _normalise_provider(raw: object) -> str:
         "claude": "claude_cli",
         "codex": "codex_cli",
         "open_router": "openrouter",
+        "ai_gateway": "aigw",
+        "ai_gw": "aigw",
     }
     provider = aliases.get(provider, provider)
     if provider in AI_BRAIN_PROVIDERS:
@@ -236,6 +244,20 @@ def provider_readiness(provider: str | None = None) -> Dict[str, Any]:
                             "container — set AI_BRAIN_PROVIDER=openrouter for a "
                             "deployed instance"),
         }
+    if selected == "aigw":
+        key = os.environ.get("AIGW_API_KEY", "")
+        base_url = os.environ.get("AIGW_BASE_URL") or DEFAULT_AIGW_BASE_URL
+        is_loopback = _is_loopback_url(base_url)
+        return {
+            "provider": "aigw",
+            "ready": bool(key),
+            "deployable": not is_loopback,
+            "reason": "" if key else "aigw selected but AIGW_API_KEY is unset",
+            "deploy_note": ("" if not is_loopback else
+                             f"AIGW_BASE_URL resolves to a loopback address ({base_url}) "
+                             "reachable only from this host — not usable in a container "
+                             "unless AIGW_BASE_URL is pointed at a reachable gateway"),
+        }
     key = os.environ.get("OPENROUTER_API_KEY", "")
     return {
         "provider": "openrouter",
@@ -246,6 +268,15 @@ def provider_readiness(provider: str | None = None) -> Dict[str, Any]:
     }
 
 
+def _is_loopback_url(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return True
+    return host in ("localhost", "127.0.0.1", "::1", "")
+
+
 def get_brain(provider: str | None = None) -> AiBrain:
     """Return the configured AI brain strategy."""
     selected = _normalise_provider(provider) if provider else selected_ai_brain_provider()
@@ -253,6 +284,8 @@ def get_brain(provider: str | None = None) -> AiBrain:
         return ClaudeCliBrain()
     if selected == "codex_cli":
         return CodexCliBrain()
+    if selected == "aigw":
+        return AigwBrain()
     return OpenRouterBrain()
 
 
@@ -390,6 +423,96 @@ def _openrouter_web_search_tool() -> dict[str, Any]:
             "max_total_results": max_total_results,
         },
     }
+
+
+class AigwBrain:
+    """OpenAI-compatible completion via the operator's local ai-gateway.
+
+    ai-gateway (com.andychoi.ai-gateway) fronts whichever backend the operator
+    configured — e.g. the z.ai GLM Coding Plan — behind a plain
+    `/v1/chat/completions` endpoint, so this is the same request/response
+    shape as OpenRouterBrain minus the OpenRouter-specific web-search tool and
+    402 degraded-token retry (neither is a documented gateway behavior).
+    """
+
+    provider = "aigw"
+
+    def complete(self, system_prompt: str, user_message: str,
+                 web_search: bool = False) -> str:
+        if web_search:
+            logger.debug("[ai-brain] web_search requested but aigw has no declared "
+                          "search tool — ignored")
+        api_key = os.environ.get("AIGW_API_KEY", "")
+        model = os.environ.get("AIGW_MODEL", "")
+        base_url = (os.environ.get("AIGW_BASE_URL") or DEFAULT_AIGW_BASE_URL).rstrip("/")
+
+        if not api_key:
+            logger.warning("[research] AIGW_API_KEY not set — returning empty response")
+            return ""
+        if not model:
+            logger.warning("[research] AIGW_MODEL not set — returning empty response")
+            return ""
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                self._async_do_call(base_url, api_key, model, system_prompt, user_message)
+            )
+        except Exception as exc:
+            logger.error(
+                f"[research] aigw call FAILED: {type(exc).__name__}: {exc} — "
+                "AI research is DOWN, all verdicts will default to PASS until fixed."
+            )
+            return ""
+        finally:
+            loop.close()
+
+    async def _async_do_call(
+        self, base_url: str, api_key: str, model: str,
+        system_prompt: str, user_message: str,
+    ) -> str:
+        try:
+            max_tokens = int(os.environ.get("AIGW_MAX_TOKENS", "2048"))
+        except (TypeError, ValueError):
+            max_tokens = 2048
+        max_tokens = max(500, min(max_tokens, 4096))
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            "stream": False,
+            "max_tokens": max_tokens,
+            "temperature": 0.1,
+        }
+        timeout = float(os.environ.get("AI_BRAIN_TIMEOUT_S", "120") or 120)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.is_success:
+                data = resp.json()
+                choices = data.get("choices", [])
+                if choices:
+                    message = choices[0].get("message", {}) or {}
+                    return AiBrainResult(
+                        message.get("content", ""),
+                        usage=data.get("usage"),
+                        metadata={"id": data.get("id"), "model": data.get("model")},
+                    )
+                logger.error("[research] aigw returned 200 but no choices — empty response")
+                return ""
+
+            body = resp.text[:200] if resp.text else ""
+            logger.error(
+                f"[research] aigw call FAILED: HTTP {resp.status_code} — AI research is "
+                f"DOWN, all verdicts will default to PASS until fixed. {body}"
+            )
+        return ""
 
 
 class ClaudeCliBrain:
@@ -546,10 +669,14 @@ def _command_parts(raw: object, default: list[str]) -> list[str]:
 #                single model.
 #   openrouter — one model does everything incl. native openrouter:web_search;
 #                no CLI, no auxiliary model to pin (see OpenRouterBrain).
+#   aigw       — one model does everything; no declared search tool, so
+#                web_search is silently ignored (see AigwBrain). No CLI, no
+#                auxiliary model to pin.
 _WEB_SEARCH_EXEC_MODEL: dict[str, str | None] = {
     "claude_cli": "claude-haiku-4-5-20251001",
     "codex_cli": None,
     "openrouter": None,
+    "aigw": None,
 }
 
 

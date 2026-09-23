@@ -184,6 +184,147 @@ def test_openrouter_402_retry_preserves_web_tool_and_final_metadata(monkeypatch)
     assert payloads[0]["tools"] == payloads[1]["tools"]
 
 
+def test_aigw_posts_openai_compatible_payload_to_configured_base_url(monkeypatch):
+    from pathiel.agents import ai_brain
+
+    payloads: list[dict] = []
+    urls: list[str] = []
+    monkeypatch.setenv("AIGW_API_KEY", "test-aigw-key")
+    monkeypatch.setenv("AIGW_MODEL", "glm-coding-flash")
+    monkeypatch.delenv("AIGW_BASE_URL", raising=False)
+    monkeypatch.delenv("AIGW_MAX_TOKENS", raising=False)
+
+    class Response:
+        status_code = 200
+        text = ""
+        is_success = True
+
+        def json(self):
+            return {"id": "cc-1", "model": "glm-coding-flash",
+                     "choices": [{"message": {"content": "ok"}}],
+                     "usage": {"prompt_tokens": 3, "completion_tokens": 2}}
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json, headers):
+            urls.append(url)
+            payloads.append(json)
+            assert headers == {"Authorization": "Bearer test-aigw-key"}
+            return Response()
+
+    monkeypatch.setattr(ai_brain.httpx, "AsyncClient", FakeAsyncClient)
+
+    result = ai_brain.AigwBrain().complete("system", "user", web_search=True)
+    assert result == "ok"
+    assert result.usage == {"prompt_tokens": 3, "completion_tokens": 2}
+    assert urls == ["http://localhost:11433/v1/chat/completions"]
+    assert "tools" not in payloads[-1]
+    assert payloads[-1]["model"] == "glm-coding-flash"
+    assert payloads[-1]["messages"] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "user"},
+    ]
+
+
+def test_aigw_honors_base_url_override(monkeypatch):
+    from pathiel.agents import ai_brain
+
+    urls: list[str] = []
+    monkeypatch.setenv("AIGW_API_KEY", "k")
+    monkeypatch.setenv("AIGW_MODEL", "m")
+    monkeypatch.setenv("AIGW_BASE_URL", "https://gw.example.test/v1/")
+
+    class Response:
+        status_code = 200
+        text = ""
+        is_success = True
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json, headers):
+            urls.append(url)
+            return Response()
+
+    monkeypatch.setattr(ai_brain.httpx, "AsyncClient", FakeAsyncClient)
+    assert ai_brain.AigwBrain().complete("S", "U") == "ok"
+    assert urls == ["https://gw.example.test/v1/chat/completions"]
+
+
+def test_aigw_missing_key_or_model_returns_empty(monkeypatch):
+    from pathiel.agents import ai_brain
+
+    monkeypatch.delenv("AIGW_API_KEY", raising=False)
+    monkeypatch.setenv("AIGW_MODEL", "m")
+    assert ai_brain.AigwBrain().complete("S", "U") == ""
+
+    monkeypatch.setenv("AIGW_API_KEY", "k")
+    monkeypatch.delenv("AIGW_MODEL", raising=False)
+    assert ai_brain.AigwBrain().complete("S", "U") == ""
+
+
+def test_aigw_http_failure_returns_empty(monkeypatch):
+    from pathiel.agents import ai_brain
+
+    monkeypatch.setenv("AIGW_API_KEY", "k")
+    monkeypatch.setenv("AIGW_MODEL", "m")
+
+    class Response:
+        status_code = 500
+        text = "boom"
+        is_success = False
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json, headers):
+            return Response()
+
+    monkeypatch.setattr(ai_brain.httpx, "AsyncClient", FakeAsyncClient)
+    assert ai_brain.AigwBrain().complete("S", "U") == ""
+
+
+def test_selected_provider_normalises_aigw_aliases(monkeypatch):
+    from pathiel.agents.ai_brain import selected_ai_brain_provider
+
+    monkeypatch.setenv("AI_BRAIN_PROVIDER", "ai_gateway")
+    assert selected_ai_brain_provider({}) == "aigw"
+    monkeypatch.setenv("AI_BRAIN_PROVIDER", "aigw")
+    assert selected_ai_brain_provider({}) == "aigw"
+
+
+def test_get_brain_returns_aigw_brain(monkeypatch):
+    from pathiel.agents import ai_brain
+
+    monkeypatch.setenv("AI_BRAIN_PROVIDER", "aigw")
+    assert isinstance(ai_brain.get_brain(), ai_brain.AigwBrain)
+
+
 def test_claude_cli_parses_envelope_and_requires_verdict_json(monkeypatch):
     from pathiel.agents import ai_brain
 
