@@ -33,6 +33,41 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
+# Load .env.local into THIS shell's environment — file value only if the var
+# isn't already set, mirroring `os.environ.setdefault` in
+# pathiel/server.py::_load_env_local_early() and
+# services/trend_engine/env.py::load(), the two loaders every process this
+# script starts actually runs. Without this, restart.sh's OWN bash-side
+# decisions (which PY interpreter to use, the port it prints in its startup
+# message, the rate-limit knobs it hands the server via `nohup env ...`,
+# PATHIEL_STATE_DIR, disk-guard and startup-grace overrides) silently fell
+# back to their hardcoded defaults instead of whatever the operator set in
+# .env.local, even though the actual Python process picked up the real value
+# — so restart.sh printed "port 8000" for a server that was really listening
+# on 8090 (found 2026-09-23). This replaces the old PATHIEL_STATE_DIR-only
+# special case, which had this exact split-brain bug for every OTHER var plus
+# its own `set -e` crash on a no-match grep for that one var. Runs before the
+# PY interpreter is picked so a PATHIEL_PY set only in .env.local also takes
+# effect here, not just in the subprocess env.
+load_env_local() {
+  local env_file="$ROOT/.env.local"
+  [[ -f "$env_file" ]] || return 0
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ -z "${!key:-}" ]]; then
+      export "$key=$value"
+    fi
+  done < "$env_file"
+}
+load_env_local
+
 # Prefer the project venv interpreter (it has the full dep set incl.
 # prometheus_client + the hyperliquid stack). Bare `python3` on PATH was a
 # different interpreter missing server deps. Override with PATHIEL_PY if needed.
@@ -77,23 +112,13 @@ err()   { printf "%s✗%s %s\n" "$C_RED" "$C_OFF" "$*" >&2; }
 # `stoploop` as a kill switch — the one control that has to work. So every
 # stop-and-stay-stopped action records its component here, and every start
 # clears it. The marker is the operator's intent; the supervisor obeys it.
-# Must match STATE_DIR in scripts/supervise_processes.py — PATHIEL_STATE_DIR,
-# else the project root. A halt marker written where the supervisor does not
-# look is a kill switch that silently does nothing, which is exactly what
-# happened: .env.local carries PATHIEL_STATE_DIR and this script never read it,
-# so `stoploop` wrote the marker to the repo root while the supervisor — run by
-# the scheduler, which does load the env — looked in .state/ and restarted the
-# loop two minutes later.
-if [[ -z "${PATHIEL_STATE_DIR:-}" && -f "$ROOT/.env.local" ]]; then
-  # PATHIEL_STATE_DIR is OPTIONAL (services/trend_engine/env.py falls back to
-  # $ROOT when unset) — most .env.local files never set it, so `grep` finding
-  # no match is the common case, not an error. Without `|| true` that no-match
-  # (grep exit 1) propagates through the pipeline under `set -euo pipefail`
-  # and silently kills this script before it does anything — which is exactly
-  # what made `restart.sh status` print nothing (found 2026-09-23).
-  PATHIEL_STATE_DIR="$(grep -E '^PATHIEL_STATE_DIR=' "$ROOT/.env.local" | tail -1 | cut -d= -f2- || true)"
-  export PATHIEL_STATE_DIR
-fi
+# Must match STATE_DIR in scripts/supervise_processes.py — PATHIEL_STATE_DIR
+# (now loaded above by load_env_local), else the project root. A halt marker
+# written where the supervisor does not look is a kill switch that silently
+# does nothing, which is exactly what happened before this script loaded
+# .env.local at all: `stoploop` wrote the marker to the repo root while the
+# supervisor — run by the scheduler, which does load the env — looked in
+# .state/ and restarted the loop two minutes later.
 HALT_FILE="${PATHIEL_STATE_DIR:-$ROOT}/supervisor_halt.json"
 
 halt_mark() {   # halt_mark <component>

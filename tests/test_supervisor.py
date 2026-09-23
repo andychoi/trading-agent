@@ -456,9 +456,15 @@ def test_restart_sh_and_the_supervisor_resolve_the_SAME_halt_file(tmp_path):
     script = open(os.path.join(ROOT, "scripts", "restart.sh")).read()
 
     # Run just the resolution block restart.sh uses, with ROOT pointed at the
-    # fixture, and print what it lands on.
-    block = script.split("# Must match STATE_DIR")[1].split("halt_mark()")[0]
-    block = "ROOT=" + str(tmp_path) + "\n" + block.split("\n", 1)[1] + '\necho "$HALT_FILE"\n'
+    # fixture, and print what it lands on. Must include load_env_local() and
+    # its call — that's what actually pulls PATHIEL_STATE_DIR out of
+    # .env.local; the old cut point (the "# Must match STATE_DIR" comment,
+    # right before the bare HALT_FILE= assignment) predates that function and
+    # silently stopped covering the real lookup once it moved earlier in the
+    # file.
+    fn_start = script.index("load_env_local() {")
+    block = script[fn_start:].split("halt_mark()")[0]
+    block = "ROOT=" + str(tmp_path) + "\n" + block + '\necho "$HALT_FILE"\n'
     got = subprocess.run(["bash", "-c", block], capture_output=True, text=True,
                          env={"PATH": os.environ["PATH"]}).stdout.strip()
 
